@@ -44,18 +44,25 @@ class SurveyAnswersRepo(BaseRepo):
                         (survey_answers_id,))
             rows += cur.fetchall()
 
-            # TODO:  We probably can't merge the PR with this change, need
-            #  a policy to resolve these survey ids (unless they only happen
-            #  in dev builds)
-            # TODO:  It's even worse than I feared.  Some of our primary
-            #  surveys are ALSO vioscreen surveys with the same key. wtf.
             if len(rows) == 0:
+                # see if it's vioscreen
                 vioscreen_repo = VioscreenRepo(self._transaction)
                 status = vioscreen_repo._get_vioscreen_status(
                     survey_answers_id)
                 if status is not None:
                     return SurveyTemplateRepo.VIOSCREEN_ID, status
+
+                # see if it's myfoodrepo
+                cur.execute("""SELECT EXISTS (
+                                   SELECT myfoodrepo_id
+                                   FROM myfoodrepo_registry
+                                   WHERE myfoodrepo_id=%s)""",
+                            (survey_answers_id, ))
+                if cur.fetchone()[0] is True:
+                    return SurveyTemplateRepo.MYFOODREPO_ID, None
                 else:
+                    # not vioscreen and not myfoodrepo?
+
                     return None, None
                     # TODO: Maybe this should throw an exception, but doing so
                     #  locks the end user out of the minimal implementation
@@ -309,6 +316,12 @@ class SurveyAnswersRepo(BaseRepo):
                         "WHERE "
                         "account_id = %s AND vio_id = %s",
                         (acct_id, survey_id))
+            cur.execute("UPDATE myfoodrepo_registry SET "
+                        "deleted=true, "
+                        "source_id = NULL "
+                        "WHERE "
+                        "account_id = %s AND myfoodrepo_id = %s",
+                        (acct_id, survey_id))
         return True
 
     def associate_answered_survey_with_sample(self, account_id, source_id,
@@ -352,7 +365,7 @@ class SurveyAnswersRepo(BaseRepo):
                         "barcode = %s AND "
                         "survey_id = %s",
                         (s.barcode, survey_id))
-            # Also delete from vioscreen registry
+            # Also delete from vioscreen and myfoodrepo registries
             cur.execute("UPDATE vioscreen_registry "
                         "SET deleted=true "
                         "WHERE "
@@ -361,6 +374,13 @@ class SurveyAnswersRepo(BaseRepo):
                         "sample_id = %s AND "
                         "vio_id = %s",
                         (account_id, source_id, sample_id, survey_id))
+            cur.execute("UPDATE myfoodrepo_registry "
+                        "SET deleted=true "
+                        "WHERE "
+                        "account_id = %s AND "
+                        "source_id = %s AND "
+                        "myfoodrepo_id = %s",
+                        (account_id, source_id, survey_id))
 
     def build_metadata_map(self):
         with self._transaction.cursor() as cur:
@@ -429,3 +449,31 @@ class SurveyAnswersRepo(BaseRepo):
                 return []
             else:
                 return [r[0] for r in sample_rows]
+
+    def scrub(self, account_id, source_id, survey_id):
+        """Replace free text with scrubbed text"""
+        with self._transaction.cursor() as cur:
+            cur.execute("""SELECT survey_id
+                           FROM ag.ag_login_surveys
+                           WHERE ag_login_id = %s AND
+                               source_id = %s AND
+                               survey_id = %s""",
+                        (account_id, source_id, survey_id))
+            res = cur.fetchone()
+            if res is None:
+                raise RepoException("Invalid account / source / survey "
+                                    "relation")
+
+            text = 'scrubbed'
+            cur.execute("""UPDATE survey_answers_other
+                           SET response=%s
+                           WHERE survey_id=%s
+                               AND survey_question_id IN (
+                                   SELECT survey_question_id
+                                   FROM survey_answers_other
+                                       JOIN survey_question_response_type
+                                           USING (survey_question_id)
+                                   WHERE survey_response_type='TEXT'
+                                       AND survey_id=%s
+                                   )""",
+                        (text, survey_id, survey_id))

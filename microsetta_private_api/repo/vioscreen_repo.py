@@ -8,7 +8,8 @@ from microsetta_private_api.model.vioscreen import (
     VioscreenFoodComponents, VioscreenFoodComponentsComponent,
     VioscreenEatingPatterns, VioscreenEatingPatternsComponent,
     VioscreenMPeds, VioscreenMPedsComponent,
-    VioscreenFoodConsumption, VioscreenFoodConsumptionComponent)
+    VioscreenFoodConsumption, VioscreenFoodConsumptionComponent,
+    VioscreenComposite)
 from werkzeug.exceptions import NotFound
 
 
@@ -195,6 +196,49 @@ class VioscreenSessionRepo(BaseRepo):
             else:
                 raise ValueError("A sample should not have multiple FFQs")
 
+    def get_missing_ffqs(self):
+        """The set of valid sessions which lack FFQ data
+
+        An valid session but missing session is one that meets
+        the following criteria:
+
+        1) the ag.vioscreen_sessions entry is "Finished"
+        2) the ag.vioscreen_sessions entry endDate is not null
+        3) the sessionId is not present in one of the vioscreen FFQ
+           decomposed tables
+
+        Returns
+        -------
+        list of VioscreenSession
+            The missing sessions
+        """
+        with self._transaction.cursor() as cur:
+            # criteria 1 and 2, check endDate and status
+            cur.execute("""SELECT sessionid
+                           FROM ag.vioscreen_sessions
+                           WHERE endDate IS NOT NULL
+                               AND status = 'Finished'""")
+            complete_sessions = {i[0] for i in cur.fetchall()}
+
+            # criteria 3, determine sessions which we have ffq data for
+            cur.execute("""SELECT distinct(sessionid)
+                           FROM ag.vioscreen_percentenergy""")
+            sessions_with_data = {i[0] for i in cur.fetchall()}
+
+            sessions_without_data = complete_sessions - sessions_with_data
+
+            without_data = []
+            if sessions_without_data:
+                # construct session objects for all of our missing sessions
+                cur.execute(f"""SELECT {self._sql_cols}
+                                FROM ag.vioscreen_sessions
+                                  WHERE sessionId IN %s""",
+                            (tuple(sessions_without_data), ))
+                for row in cur.fetchall():
+                    without_data.append(VioscreenSession(*row))
+
+        return without_data
+
 
 class VioscreenPercentEnergyRepo(BaseRepo):
     # code : (long description, short description, units)
@@ -306,58 +350,77 @@ class VioscreenPercentEnergyRepo(BaseRepo):
 
 class VioscreenDietaryScoreRepo(BaseRepo):
     # scoresType : { code: (name, lower limit, upper limit) }
-    _CODES = {'Hei2010': {
-        'TotalVegetables': ('Total Vegetables', 0.0, 5.0),
-        'GreensAndBeans': ('Greens and Beans', 0.0, 5.0),
-        'TotalFruit': ('Total Fruit', 0.0, 5.0),
-        'WholeFruit': ('Whole Fruit', 0.0, 5.0),
-        'WholeGrains': ('Whole Grains', 0.0, 10.0),
-        'Dairy': ('Dairy', 0.0, 10.0),
-        'TotalProteins': ('Total Protein Foods', 0.0, 5.0),
-        'SeafoodAndPlantProteins': ('Seafood and Plant Proteins',
-                                    0.0, 5.0),
-        'FattyAcids': ('Fatty Acids', 0.0, 10.0),
-        'RefinedGrains': ('Refined Grains', 0.0, 10.0),
-        'Sodium': ('Sodium', 0.0, 10.0),
-        'EmptyCalories': ('Empty Calories', 0.0, 20.0),
-        'TotalScore': ('Total HEI Score', 0.0, 100.0)
-    }}
+    _CODES = {
+        'Hei2010': {
+            'TotalVegetables': ('Total Vegetables', 0.0, 5.0),
+            'GreensAndBeans': ('Greens and Beans', 0.0, 5.0),
+            'TotalFruit': ('Total Fruit', 0.0, 5.0),
+            'WholeFruit': ('Whole Fruit', 0.0, 5.0),
+            'WholeGrains': ('Whole Grains', 0.0, 10.0),
+            'Dairy': ('Dairy', 0.0, 10.0),
+            'TotalProteins': ('Total Protein Foods', 0.0, 5.0),
+            'SeafoodAndPlantProteins': ('Seafood and Plant Proteins',
+                                        0.0, 5.0),
+            'FattyAcids': ('Fatty Acids', 0.0, 10.0),
+            'RefinedGrains': ('Refined Grains', 0.0, 10.0),
+            'Sodium': ('Sodium', 0.0, 10.0),
+            'EmptyCalories': ('Empty Calories', 0.0, 20.0),
+            'TotalScore': ('Total HEI Score', 0.0, 100.0)},
+        'Hei2015': {
+            'TotalVegetables': ('Total Vegetables', 0.0, 5.0),
+            'GreensAndBeans': ('Greens and Beans', 0.0, 5.0),
+            'TotalFruit': ('Total Fruit', 0.0, 5.0),
+            'WholeFruit': ('Whole Fruit', 0.0, 5.0),
+            'WholeGrains': ('Whole Grains', 0.0, 10.0),
+            'Dairy': ('Dairy', 0.0, 10.0),
+            'TotalProteins': ('Total Protein Foods', 0.0, 5.0),
+            'SeafoodAndPlantProteins': ('Seafood and Plant Proteins',
+                                        0.0, 5.0),
+            'FattyAcids': ('Fatty Acids', 0.0, 10.0),
+            'RefinedGrains': ('Refined Grains', 0.0, 10.0),
+            'Sodium': ('Sodium', 0.0, 10.0),
+            'SaturatedFat': ('SaturatedFat', 0.0, 10.0),
+            'AddedSugars': ('AddedSugars', 0.0, 10.0),
+            'TotalScore': ('Total HEI Score', 0.0, 100.0)},
+        }
 
     def __init__(self, transaction):
         super().__init__(transaction)
 
-    def insert_dietary_score(self, vioscreen_dietary_score):
+    def insert_dietary_scores(self, vioscreen_dietary_scores):
         """Add in dietary score results for a session
 
         Parameters
         ----------
-        vioscreen_dietary_score : VioscreenDietaryScore
-            An instance of a dietary score model
+        vioscreen_dietary_scores : list of VioscreenDietaryScore
+            Dietary score models to insert
 
         Returns
         -------
         int
             The number of inserted rows
         """
+        count = 0
         with self._transaction.cursor() as cur:
-            scores = vioscreen_dietary_score.scores
-            inserts = []
-            for score in scores:
-                # checking if code exists in lookup
-                self._get_code_info(
-                    vioscreen_dietary_score.scoresType, score.code)
-                inserts.append((vioscreen_dietary_score.sessionId,
-                                vioscreen_dietary_score.scoresType,
-                                score.code,
-                                score.score))
+            for model in vioscreen_dietary_scores:
+                scores = model.scores
+                inserts = []
+                for score in scores:
+                    # checking if code exists in lookup
+                    self._get_code_info(model.scoresType, score.code)
+                    inserts.append((model.sessionId,
+                                    model.scoresType,
+                                    score.code,
+                                    score.score))
 
-            cur.executemany("""INSERT INTO ag.vioscreen_dietaryscore
-                                (sessionId, scoresType, code, score)
-                                VALUES (%s, %s, %s, %s)""",
-                            inserts)
-            return cur.rowcount
+                cur.executemany("""INSERT INTO ag.vioscreen_dietaryscore
+                                    (sessionId, scoresType, code, score)
+                                    VALUES (%s, %s, %s, %s)""",
+                                inserts)
+                count += cur.rowcount
+        return count
 
-    def get_dietary_score(self, sessionId):
+    def get_dietary_scores(self, sessionId):
         """Obtain the dietary score detail for a particular session
 
         Parameters
@@ -367,33 +430,36 @@ class VioscreenDietaryScoreRepo(BaseRepo):
 
         Returns
         -------
-        VioscreenDietaryScore or None
+        list of VioscreenDietaryScore or None
             The dietary score detail, or None if no record was found
         """
-        with self._transaction.cursor() as cur:
-            cur.execute("""SELECT scoresType, code, score
-                           FROM ag.vioscreen_dietaryscore
-                           WHERE sessionId = %s""",
-                        (sessionId,))
+        sql = """SELECT scoresType, code, score
+                 FROM ag.vioscreen_dietaryscore
+                 WHERE sessionId = %s"""
+        df = pd.read_sql(sql, self._transaction.conn, params=(sessionId, ))
 
-            rows = cur.fetchall()
-            if len(rows) > 0:
-                total_scoresType = ""
-                components = []
-                for scoresType, code, score in rows:
-                    total_scoresType = scoresType
-                    codeInfo = self._get_code_info(scoresType, code)
-                    vdsc = VioscreenDietaryScoreComponent(code=code,
-                                                          name=codeInfo[0],
-                                                          score=score,
-                                                          lowerLimit=codeInfo[1],  # noqa
-                                                          upperLimit=codeInfo[2])  # noqa
-                    components.append(vdsc)
-                return VioscreenDietaryScore(sessionId=sessionId,
-                                             scoresType=total_scoresType,
-                                             scores=components)
-            else:
-                return None
+        if len(df) == 0:
+            return None
+
+        scores = []
+        # note the header is cast to lowerase
+        for type_, grp in df.groupby('scorestype'):
+            components = []
+            for _, row in grp.iterrows():
+                code = row['code']
+                score = row['score']
+                codeInfo = self._get_code_info(type_, code)
+                vdsc = VioscreenDietaryScoreComponent(code=code,
+                                                      name=codeInfo[0],
+                                                      score=score,
+                                                      lowerLimit=codeInfo[1],
+                                                      upperLimit=codeInfo[2])
+                components.append(vdsc)
+
+            scores.append(VioscreenDietaryScore(sessionId=sessionId,
+                                                scoresType=type_,
+                                                scores=components))
+        return scores
 
     def _get_code_info(self, scoresType, code):
         """Obtain the detail about a particular score type by its code
@@ -425,6 +491,38 @@ class VioscreenDietaryScoreRepo(BaseRepo):
             raise NotFound("No such code: " + code)
 
         return scores[code]
+
+    def get_dietary_scores_by_component(self, scoresType, code):
+        """Obtain the all the dietary scores for a particular component
+        Parameters
+        ----------
+        scoresType : str
+            The scoresType to query
+        code : str
+            The code to query
+        Returns
+        -------
+        Float Array or None
+            The dietary scores, or None if no record was found
+        """
+        with self._transaction.cursor() as cur:
+            cur.execute("""SELECT score
+                           FROM ag.vioscreen_dietaryscore
+                           WHERE scoresType = %s AND code = %s""",
+                        (scoresType, code))
+
+            rows = cur.fetchall()
+            if len(rows) > 0:
+                scores = []
+                for score in rows:
+                    scores.append(score[0])
+                return scores
+
+            else:
+                return None
+
+    def get_dietary_scores_descriptions(self):
+        return self._CODES
 
 
 class VioscreenSupplementsRepo(BaseRepo):
@@ -765,6 +863,36 @@ class VioscreenFoodComponentsRepo(BaseRepo):
             raise NotFound("No such code: " + code)
 
         return self._CODES[code]
+
+    def get_food_components_by_code(self, code):
+        """Obtain the all the amounts for a particular code
+        Parameters
+        ----------
+        code : str
+            The code to query
+        Returns
+        -------
+        Float Array or None
+            The amounts, or None if no record was found
+        """
+        with self._transaction.cursor() as cur:
+            cur.execute("""SELECT amount
+                           FROM ag.vioscreen_foodcomponents
+                           WHERE code = %s""",
+                        (code,))
+
+            rows = cur.fetchall()
+            if len(rows) > 0:
+                amounts = []
+                for amount in rows:
+                    amounts.append(amount[0])
+                return amounts
+
+            else:
+                return None
+
+    def get_food_components_descriptions(self):
+        return self._CODES
 
 
 class VioscreenEatingPatternsRepo(BaseRepo):
@@ -1332,7 +1460,7 @@ class VioscreenFoodConsumptionRepo(BaseRepo):
             rows = cur.fetchall()
             if len(rows) > 0:
                 components = []
-                for (foodCode, description, foodGroup, amount, frequency,
+                for (foodCode, description, foodGroup, amount_outer, frequency,
                      consumptionAdjustment, servingSizeText,
                      servingFrequencyText, created) in rows:
                     cur.execute("""SELECT code, amount
@@ -1357,7 +1485,7 @@ class VioscreenFoodConsumptionRepo(BaseRepo):
                         foodCode=foodCode,
                         description=description,
                         foodGroup=foodGroup,
-                        amount=amount,
+                        amount=amount_outer,
                         frequency=frequency,
                         consumptionAdjustment=consumptionAdjustment,
                         servingSizeText=servingSizeText,
@@ -1400,6 +1528,68 @@ class VioscreenFoodConsumptionRepo(BaseRepo):
 class VioscreenRepo(BaseRepo):
     def __init__(self, transaction):
         super().__init__(transaction)
+
+    def insert_ffq(self, ffq):
+        """Represent an ffq instance in our database
+
+        Parameters
+        ----------
+        ffq : VioscreenComposite instance
+            A complete ffq
+        """
+        sess = VioscreenSessionRepo(self._transaction)
+        supp = VioscreenSupplementsRepo(self._transaction)
+        scores = VioscreenDietaryScoreRepo(self._transaction)
+        energy = VioscreenPercentEnergyRepo(self._transaction)
+        food = VioscreenFoodComponentsRepo(self._transaction)
+        patterns = VioscreenEatingPatternsRepo(self._transaction)
+        mpeds = VioscreenMPedsRepo(self._transaction)
+        cons = VioscreenFoodConsumptionRepo(self._transaction)
+
+        sess.upsert_session(ffq.session)
+        energy.insert_percent_energy(ffq.percent_energy)
+        scores.insert_dietary_scores(ffq.dietary_scores)
+        supp.insert_supplements(ffq.supplements)
+        food.insert_food_components(ffq.food_components)
+        patterns.insert_eating_patterns(ffq.eating_patterns)
+        mpeds.insert_mpeds(ffq.mpeds)
+        cons.insert_food_consumption(ffq.food_consumption)
+
+    def get_ffq(self, session_id):
+        """Obtain a complete ffq
+
+        Parameters
+        ----------
+        session_id : str
+            The session ID to obtain a FFQ for
+
+        Returns
+        -------
+        VioscreenComposite or None
+            The composite object if the FFQ exists
+        """
+        sess = VioscreenSessionRepo(self._transaction)
+        supp = VioscreenSupplementsRepo(self._transaction)
+        scores = VioscreenDietaryScoreRepo(self._transaction)
+        energy = VioscreenPercentEnergyRepo(self._transaction)
+        food = VioscreenFoodComponentsRepo(self._transaction)
+        patterns = VioscreenEatingPatternsRepo(self._transaction)
+        mpeds = VioscreenMPedsRepo(self._transaction)
+        cons = VioscreenFoodConsumptionRepo(self._transaction)
+
+        session = sess.get_session(session_id)
+        percent_energy = energy.get_percent_energy(session_id)
+        dietary_scores = scores.get_dietary_scores(session_id)
+        supplements = supp.get_supplements(session_id)
+        eating_patterns = patterns.get_eating_patterns(session_id)
+        mpeds = mpeds.get_mpeds(session_id)
+        food_consumption = cons.get_food_consumption(session_id)
+        food_components = food.get_food_components(session_id)
+
+        return VioscreenComposite(session, percent_energy, dietary_scores,
+                                  supplements, food_components,
+                                  eating_patterns, mpeds,
+                                  food_consumption)
 
     def upsert_vioscreen_status(self, account_id, source_id,
                                 survey_id, status):

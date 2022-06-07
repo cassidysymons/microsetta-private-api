@@ -1,6 +1,5 @@
 from unittest import TestCase
-from datetime import date
-import datetime
+from datetime import date, datetime, timedelta, timezone
 import dateutil.parser
 import psycopg2
 import psycopg2.extras
@@ -21,20 +20,16 @@ from microsetta_private_api.admin.admin_impl import validate_admin_access
 
 STANDARD_ACCT_ID = "12345678-bbbb-cccc-dddd-eeeeffffffff"
 ADMIN_ACCT_ID = "12345678-1234-1234-1234-123412341234"
-FIRST_DAKLAPACK_ARTICLE = {'dak_article_code': 350100,
-                           'short_description': 'TMI 1 tube',
-                           'num_2point5ml_etoh_tubes': 1,
-                           'num_7ml_etoh_tube': 0,
-                           'num_neoteryx_kit': 0,
-                           'outer_sleeve': 'Microsetta',
-                           'box': 'Microsetta',
-                           'return_label': 'Microsetta',
-                           'compartment_bag': 'Microsetta',
-                           'num_stool_collector': 0,
-                           'instructions': 'Fv1',
-                           'registration_card': 'Microsetta',
-                           'swabs': '1x bag of two',
-                           'rigid_safety_bag': 'yes'}
+FIRST_LIVE_DAK_ARTICLE = {'dak_article_code': '3510000E',
+                          'short_description': 'TMI 1 tube',
+                          'detailed_description':
+                              'TMI 1 tube, American English'
+                          }
+# This is the first one in the db, but it is retired
+FIRST_DAK_ARTICLE = {'dak_article_code': '350103',
+                     'short_description': 'TMI 2 tubes',
+                     'detailed_description': 'TMI 2 tubes'
+                     }
 
 
 def add_dummy_scan(scan_dict):
@@ -206,7 +201,7 @@ class AdminTests(TestCase):
         with t.dict_cursor() as cur:
             cur.executemany("INSERT INTO barcodes.daklapack_order "
                             "(dak_order_id, submitter_acct_id, "
-                            "description, fulfillment_hold_msg, "
+                            "description, planned_send_date, "
                             "order_json, creation_timestamp, "
                             "last_polling_timestamp, last_polling_status) "
                             "VALUES (%s, %s, %s, %s,%s, %s, %s, %s)",
@@ -304,9 +299,8 @@ class AdminRepoTests(AdminTests):
     #  these fixed ones
     def test_retrieve_diagnostics_by_barcode_w_extra_info(self):
         def make_tz_datetime(y, m, d):
-            return datetime.datetime(y, m, d, 0, 0,
-                                     tzinfo=psycopg2.tz.FixedOffsetTimezone(
-                                         offset=-420, name=None))
+            return datetime(y, m, d, 0, 0,
+                            tzinfo=timezone(timedelta(minutes=-420)))
 
         # Non-AGP barcode so no acct, source, or sample;
         # also no preexisting scans in test db
@@ -996,14 +990,23 @@ class AdminRepoTests(AdminTests):
         # and is 2nd in (zero-based) list, after project 2
         self.assertEqual(updated_dict, output[1].to_api())
 
-    def test_get_daklapack_articles(self):
+    def test_get_daklapack_articles_not_retired(self):
         with Transaction() as t:
             admin_repo = AdminRepo(t)
             articles = admin_repo.get_daklapack_articles()
-            self.assertEqual(9, len(articles))
+            self.assertEqual(11, len(articles))
             first_article = articles[0]
             first_article.pop("dak_article_id")
-            self.assertEqual(FIRST_DAKLAPACK_ARTICLE, first_article)
+            self.assertEqual(FIRST_LIVE_DAK_ARTICLE, first_article)
+
+    def test_get_daklapack_articles_all(self):
+        with Transaction() as t:
+            admin_repo = AdminRepo(t)
+            articles = admin_repo.get_daklapack_articles(include_retired=True)
+            self.assertEqual(19, len(articles))
+            first_article = articles[0]
+            first_article.pop("dak_article_id")
+            self.assertEqual(FIRST_DAK_ARTICLE, first_article)
 
     def test_create_daklapack_order(self):
         with Transaction() as t:
@@ -1083,12 +1086,12 @@ class AdminRepoTests(AdminTests):
             last_polling_timestamp = dateutil.parser.isoparse(
                 "2020-10-19T12:40:19.219328Z")
             desc = "a description"
-            hold_msg = "hold this order"
+            planned_send_date = date(2032, 2, 9)
             last_status = "accepted"
 
             # create dummy daklapack order object
             input = DaklapackOrder(input_id, submitter_acct, list(project_ids),
-                                   order_struct, desc, hold_msg,
+                                   order_struct, desc, planned_send_date,
                                    creation_timestamp, last_polling_timestamp,
                                    last_status)
 
@@ -1101,7 +1104,7 @@ class AdminRepoTests(AdminTests):
             expected_record = [input_id,
                                submitter_id,
                                desc,
-                               hold_msg,
+                               planned_send_date,
                                order_struct,
                                creation_timestamp,
                                last_polling_timestamp,
@@ -1189,3 +1192,30 @@ class AdminRepoTests(AdminTests):
                 curr_records = cur.fetchall()
                 self.assertEqual(len(curr_records), 1)
                 self.assertEqual(expected_record, curr_records[0])
+
+    def test_set_kit_uuids_for_dak_order(self):
+        with Transaction() as t:
+            dummy_orders = self.make_dummy_dak_orders(t)
+            a_dak_order_id = dummy_orders[0][0]
+
+            with t.dict_cursor() as cur:
+                cur.execute("SELECT kit_uuid "
+                            "FROM barcodes.kit LIMIT 2;")
+                two_kit_uuids_rows = cur.fetchall()
+                two_kit_uuids = [i[0] for i in two_kit_uuids_rows]
+
+            expected_records = [[a_dak_order_id, i] for i in two_kit_uuids]
+
+            admin_repo = AdminRepo(t)
+            admin_repo.set_kit_uuids_for_dak_order(
+                a_dak_order_id, two_kit_uuids)
+
+            with t.dict_cursor() as cur:
+                cur.execute("SELECT * "
+                            "FROM barcodes.daklapack_order_to_kit "
+                            "WHERE dak_order_id =  %s",
+                            (a_dak_order_id,))
+                curr_records = cur.fetchall()
+                self.assertEqual(len(curr_records), 2)
+                for expected_record in expected_records:
+                    self.assertIn(expected_record, curr_records)

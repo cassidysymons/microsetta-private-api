@@ -15,6 +15,7 @@ from microsetta_private_api.repo.account_repo import AccountRepo
 from microsetta_private_api.repo.activation_repo import ActivationRepo
 from microsetta_private_api.repo.kit_repo import KitRepo
 from microsetta_private_api.repo.transaction import Transaction
+from microsetta_private_api.config_manager import SERVER_CONFIG
 
 
 def find_accounts_for_login(token_info):
@@ -161,7 +162,35 @@ JWT_SCHEMES = (
 )
 
 
-def verify_jwt(token):
+def _verify_jwt_mock(token):
+    assert SERVER_CONFIG.get('disable_authentication', False)
+
+    ###########################################################################
+    # WARNING: use of this mock DISABLES verification of the JWT              #
+    #                                                                         #
+    # This method is intended only for use during integration testing         #
+    ###########################################################################
+    email_verification_key = 'email_verified'
+
+    token_info = None
+    try:
+        token_info = jwt.decode(token, options={"verify_signature": False})
+    except InvalidTokenError:
+        pass
+
+    # if we can't get out the encoded email, then we can't do anything
+    # interesting anyway
+    if token_info is None:
+        raise Unauthorized(INVALID_TOKEN_MSG)
+
+    # allow the test harness to explore email verification
+    if token_info[email_verification_key] is not True:
+        raise Forbidden("Email is not verified")
+
+    return token_info
+
+
+def _verify_jwt(token):
     email_verification_key = 'email_verified'
 
     token_info = None
@@ -202,6 +231,10 @@ def _validate_account_access(token_info, account_id):
         if account is None:
             raise NotFound(ACCT_NOT_FOUND_MSG)
         else:
+            if token_associated_account is not None and \
+                    token_associated_account.account_type == 'deleted':
+                raise Unauthorized()
+
             # Whether or not the token_info is associated with an admin acct
             token_authenticates_admin = \
                 token_associated_account is not None and \
@@ -220,3 +253,18 @@ def _validate_account_access(token_info, account_id):
                 raise Unauthorized()
 
         return account
+
+
+def _validate_has_account(token_info):
+    # WARNING: this does NOT authenticate a user but tests for the
+    # presence of an account
+    with Transaction() as t:
+        account_repo = AccountRepo(t)
+        token_associated_account = account_repo.find_linked_account(
+            token_info['iss'],
+            token_info['sub'])
+
+    if token_associated_account is None:
+        raise Unauthorized()
+    else:
+        return

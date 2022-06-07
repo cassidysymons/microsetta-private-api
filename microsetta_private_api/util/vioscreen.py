@@ -15,10 +15,21 @@ import requests
 
 from microsetta_private_api.config_manager import SERVER_CONFIG
 from microsetta_private_api.repo.transaction import Transaction
-from microsetta_private_api.repo.vioscreen_repo import VioscreenSessionRepo
-from microsetta_private_api.model.vioscreen import VioscreenSession
+from microsetta_private_api.repo.vioscreen_repo import (VioscreenSessionRepo,
+                                                        VioscreenRepo)
+from microsetta_private_api.model.vioscreen import (VioscreenSession,
+                                                    VioscreenPercentEnergy,
+                                                    VioscreenDietaryScore,
+                                                    VioscreenSupplements,
+                                                    VioscreenFoodComponents,
+                                                    VioscreenEatingPatterns,
+                                                    VioscreenMPeds,
+                                                    VioscreenFoodConsumption,
+                                                    VioscreenComposite)
 from microsetta_private_api.localization import ES_MX, EN_US
 
+# TODO: much of the logic in this module should be migrated and placed
+# under microsetta_private_api.client.vioscreen
 
 # the country code determines which FFQ is taken. Vioscreen determines
 # the FFQ based on the registration code. The US survey is only the
@@ -107,7 +118,8 @@ def encrypt_key(survey_id,
                 dob,
                 height,
                 weight,
-                regcode
+                regcode,
+                _testing_arguments=None
                 ):
     """Encode minimal required vioscreen information to AES key"""
     firstname = "NOT"
@@ -125,6 +137,9 @@ def encrypt_key(survey_id,
              "Visit=1",
              "EncryptQuery=True",
              "ReturnUrl={%s}" % returnurl]
+
+    if _testing_arguments is not None:
+        parts.extend(_testing_arguments)
 
     if height is not None and weight is not None:
         parts.append("Height=%s" % height)
@@ -178,6 +193,7 @@ class VioscreenAdminAPIAgent(Task):
                 "password": self.password}
 
         url = urljoin(self.baseurl, 'auth/login')
+
         req = self.session.post(url, data=data)
         if req.status_code != 200:
             # TODO: Check if this can send back 3XX redirects or anything
@@ -325,35 +341,45 @@ class VioscreenAdminAPI:
                 url,
                 **kwargs)
 
-    def _get_session_data(self, id_, name):
+    def _get_session_data(self, id_, name, **kwargs):
         url = 'sessions/%s/%s' % (id_, name)
-        result = self.get(url)
+        result = self.get(url, **kwargs)
         if 'error' in result:
             return {}
         else:
             return result
 
     def foodcomponents(self, id_):
-        return self._get_session_data(id_, 'foodcomponents').get('data')
+        data = self._get_session_data(id_, 'foodcomponents')
+        return VioscreenFoodComponents.from_vioscreen(data)
 
     def percentenergy(self, id_):
-        return self._get_session_data(id_, 'percentenergy').get('calculations')
+        data = self._get_session_data(id_, 'percentenergy')
+        return VioscreenPercentEnergy.from_vioscreen(data)
 
     def mpeds(self, id_):
-        return self._get_session_data(id_, 'mpeds').get('data')
+        data = self._get_session_data(id_, 'mpeds')
+        return VioscreenMPeds.from_vioscreen(data)
 
     def eatingpatterns(self, id_):
-        return self._get_session_data(id_, 'eatingpatterns').get('data')
+        data = self._get_session_data(id_, 'eatingpatterns')
+        return VioscreenEatingPatterns.from_vioscreen(data)
 
     def foodconsumption(self, id_):
-        return self._get_session_data(id_, 'foodconsumption')\
-            .get('foodConsumption')
+        data = self._get_session_data(id_, 'foodconsumption')
+        return VioscreenFoodConsumption.from_vioscreen(data)
 
     def dietaryscore(self, id_):
-        return self._get_session_data(id_, 'dietaryscore').get('dietaryScore')
+        scores = []
+        for scoretype in ['Hei2010', 'Hei2015']:
+            params = {'dietaryScoreType': scoretype, 'foodDatabaseId': '13'}
+            req = self._get_session_data(id_, 'dietaryscore', params=params)
+            scores.append(VioscreenDietaryScore.from_vioscreen(req))
+        return scores
 
     def supplements(self, id_):
-        return self._get_session_data(id_, 'supplements').get('data')
+        data = self._get_session_data(id_, 'supplements')
+        return VioscreenSupplements.from_vioscreen(data)
 
     def users(self):
         return self.get('users')['users']
@@ -374,26 +400,47 @@ class VioscreenAdminAPI:
             return detail['sessions']
 
     def session_detail(self, session_id):
-        return self.get('sessions/%s/detail' % session_id)
+        sess_data = self.get('sessions/%s/detail' % session_id)
+        user_data = self.user(sess_data['username'])
+        return VioscreenSession.from_vioscreen(sess_data, user_data)
 
     def get_ffq(self, session_id):
         errors = []
-        name_func = [('foodcomponents', self.foodcomponents),
-                     ('percentenergy', self.percentenergy),
-                     ('mpeds', self.mpeds),
-                     ('eatingpatterns', self.eatingpatterns),
-                     ('foodconsumption', self.foodconsumption),
-                     ('dietaryscore', self.dietaryscore)]
-        results = {}
-        for name, f in name_func:
-            data = f(session_id)
-            if data is None:
+        name_func_key = [('foodcomponents',
+                          self.foodcomponents,
+                          'food_components'),
+                         ('percentenergy',
+                          self.percentenergy,
+                          'percent_energy'),
+                         ('mpeds',
+                          self.mpeds,
+                          'mpeds'),
+                         ('eatingpatterns',
+                          self.eatingpatterns,
+                          'eating_patterns'),
+                         ('foodconsumption',
+                          self.foodconsumption,
+                          'food_consumption'),
+                         ('dietaryscore',
+                          self.dietaryscore,
+                          'dietary_scores'),
+                         ('supplements',
+                          self.supplements,
+                          'supplements')]
+        results = {'session': self.session_detail(session_id)}
+        for name, f, key in name_func_key:
+            try:
+                data = f(session_id)
+            except:  # noqa
                 errors.append("FFQ appears incomplete or not taken")
                 break
 
-            results[name] = data
+            results[key] = data
 
-        return errors, results
+        if errors:
+            return errors, None
+        else:
+            return errors, VioscreenComposite(**results)
 
     def top_food_report(self, session_id):
         result = self.post(
@@ -408,9 +455,14 @@ class VioscreenAdminAPI:
         # TODO: Celery becomes a lot harder to use when you need to wait for
         #  answers and encode/decode things.  Blah.
         if self.perform_async:
-            return base64.b64decode(result.get().encode("utf-8"))
-        else:
-            return base64.b64decode(result.encode('utf-8'))
+            result = result.get()
+
+        if isinstance(result, dict):
+            # the times we've observed this scenario, the content is
+            # {'error': 'empty ffq'}
+            return None
+
+        return base64.b64decode(result.encode('utf-8'))
 
 
 @celery.task(ignore_result=False)
@@ -423,7 +475,6 @@ def update_session_detail():
     # HOWEVER, we could implement a watch and monitor child tasks, but
     # not sure if that would be a particular benefit here
     vio_api = VioscreenAdminAPI(perform_async=False)
-
     current_task.update_state(
         state="PROGRESS",
         meta={"completion": 0,
@@ -437,6 +488,7 @@ def update_session_detail():
 
     failed_sessions = []
     n_to_get = len(unfinished_sessions)
+    n_updated = 0
     for idx, sess in enumerate(unfinished_sessions, 1):
         updated = []
 
@@ -457,7 +509,7 @@ def update_session_detail():
             else:
                 # update our model inplace
                 update = vio_api.session_detail(sess.sessionId)
-                if update['status'] != sess.status:
+                if update.status != sess.status:
                     updated.append(sess.update_from_vioscreen(update))
         except Exception as e:  # noqa
             failed_sessions.append((sess.sessionId, str(e)))
@@ -472,6 +524,7 @@ def update_session_detail():
                 for update in updated:
                     r.upsert_session(update)
                 t.commit()
+                n_updated += len(updated)
 
         current_task.update_state(
             state="PROGRESS",
@@ -483,14 +536,77 @@ def update_session_detail():
         state="SUCCESS",
         meta={"completion": n_to_get,
               "status": "SUCCESS",
-              "message": f"{n_to_get} sessions updated"})
+              "message": f"{n_updated} sessions updated"})
 
     if len(failed_sessions) > 0:
         # ...and let's make Daniel feel bad about not having a better means to
         # log what hopefully never occurs
         payload = ''.join(['%s : %s\n' % (repr(s), m)
                            for s, m in failed_sessions])
-        send_email("danielmcdonald@ucsd.edu", "pester_daniel",
+        send_email(SERVER_CONFIG['pester_email'], "pester_daniel",
                    {"what": "Vioscreen sessions failed",
+                    "content": payload},
+                   EN_US)
+
+
+@celery.task(ignore_result=True)
+def fetch_ffqs():
+    MAX_FETCH_SIZE = 100
+
+    vio_api = VioscreenAdminAPI(perform_async=False)
+
+    # obtain our current unfinished sessions to check
+    with Transaction() as t:
+        r = VioscreenSessionRepo(t)
+        not_represented = r.get_unfinished_sessions()
+
+    # collect sessions to update
+    unable_to_update_session = []
+    updated_sessions = []
+    for sess in enumerate(not_represented):
+        # update session status information
+        try:
+            session_detail = vio_api.session_detail(sess)
+        except:  # noqa
+            unable_to_update_session.append(sess)
+        else:
+            updated_sessions.append(session_detail)
+
+    # perform the update after we collect everything to reduce teh length of
+    # time we hold the transaction open
+    with Transaction() as t:
+        r = VioscreenSessionRepo(t)
+        for session_detail in updated_sessions:
+            r.upsert_session(session_detail)
+        t.commit()
+
+    with Transaction() as t:
+        vs = VioscreenSessionRepo(t)
+        ffqs_not_represented = vs.get_missing_ffqs()
+
+    # fetch ffq data for sessions we don't yet have it from
+    failed_ffqs = []
+    for sess in ffqs_not_represented[:MAX_FETCH_SIZE]:
+        try:
+            error, ffq = vio_api.get_ffq(sess.sessionId)
+        except Exception as e:  # noqa
+            failed_ffqs.append((sess.sessionId, str(e)))
+            continue
+
+        if error:
+            failed_ffqs.append((sess.sessionId, repr(error)))
+        else:
+            # the call to get_ffq is long, and the data from many ffqs is
+            # large so let's insert as we go
+            with Transaction() as t:
+                vs = VioscreenRepo(t)
+                vs.insert_ffq(ffq)
+                t.commit()
+
+    if len(failed_ffqs) > 0 or len(unable_to_update_session) > 0:
+        payload = ''.join(['%s : %s\n' % (repr(s), m)
+                           for s, m in failed_ffqs + unable_to_update_session])
+        send_email(SERVER_CONFIG['pester_email'], "pester_daniel",
+                   {"what": "Vioscreen ffq insert failed",
                     "content": payload},
                    EN_US)

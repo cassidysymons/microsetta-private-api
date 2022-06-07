@@ -14,6 +14,7 @@ from microsetta_private_api.repo.activation_repo import ActivationRepo
 from microsetta_private_api.repo.event_log_repo import EventLogRepo
 from microsetta_private_api.repo.kit_repo import KitRepo
 from microsetta_private_api.repo.sample_repo import SampleRepo
+from microsetta_private_api.repo.survey_answers_repo import SurveyAnswersRepo
 from microsetta_private_api.repo.source_repo import SourceRepo
 from microsetta_private_api.repo.transaction import Transaction
 from microsetta_private_api.repo.admin_repo import AdminRepo
@@ -24,13 +25,15 @@ from microsetta_private_api.tasks import send_email as celery_send_email,\
 from microsetta_private_api.admin.email_templates import EmailMessage
 from microsetta_private_api.util.redirects import build_login_redirect
 from microsetta_private_api.admin.daklapack_communication import \
-    post_daklapack_orders, send_daklapack_hold_email
+    post_daklapack_orders
 from microsetta_private_api import localization
 from microsetta_private_api.admin.sample_summary import per_sample
+from microsetta_private_api.admin.sample_summary import get_barcodes_for
 from microsetta_private_api.util.melissa import verify_address
 from microsetta_private_api.util.query_builder_to_sql import build_condition
 from werkzeug.exceptions import Unauthorized
 from microsetta_private_api.qiita import qclient
+from microsetta_private_api.repo.interested_user_repo import InterestedUserRepo
 
 
 def search_barcode(token_info, sample_barcode):
@@ -64,6 +67,70 @@ def search_email(token_info, email):
         if diag is None:
             return jsonify(code=404, message="Email not found"), 404
         return jsonify(diag), 200
+
+
+def search_interested_users_by_email(token_info, email):
+    validate_admin_access(token_info)
+
+    with Transaction() as t:
+        i_u_repo = InterestedUserRepo(t)
+        users = i_u_repo.get_interested_user_by_email(email)
+        users_obj = {
+            "users": users
+        }
+        if users is None:
+            return jsonify(
+                code=404,
+                message="Email not found"
+            ), 404
+        return jsonify(users_obj), 200
+
+
+def get_interested_user_by_id(token_info, iuid):
+    validate_admin_access(token_info)
+
+    with Transaction() as t:
+        i_u_repo = InterestedUserRepo(t)
+        user = i_u_repo.get_interested_user_by_id(iuid)
+        if user is None:
+            return jsonify(
+                code=404,
+                message="User not found"
+            ), 404
+        return jsonify(user), 200
+
+
+def put_interested_user_by_id(token_info, iuid, body):
+    validate_admin_access(token_info)
+
+    with Transaction() as t:
+        i_u_repo = InterestedUserRepo(t)
+        user = i_u_repo.get_interested_user_by_id(iuid)
+        if user is None:
+            return jsonify(
+                code=404,
+                message="User not found"
+            ), 404
+
+        # we're going to set both address_checked and _valid to True
+        # and bypass Melissa since the address is being updated by admin
+        user.address_checked = True
+        user.address_valid = True
+        user.address_1 = body['address_1']
+        user.address_2 = body['address_2']
+        user.city = body['city']
+        user.state = body['state']
+        user.postal_code = body['postal']
+        update_success = \
+            i_u_repo.update_interested_user(user)
+
+        if update_success is False:
+            return jsonify(
+                code=400,
+                message="Failed to update address."
+            ), 400
+        t.commit()
+        return jsonify(user), 200
 
 
 def scan_barcode(token_info, sample_barcode, body):
@@ -412,11 +479,31 @@ def query_project_barcode_stats(body, token_info, strip_sampleid):
 
 def query_barcode_stats(body, token_info, strip_sampleid):
     validate_admin_access(token_info)
-    barcodes = body["sample_barcodes"]
+    if 'sample_barcodes' in body:
+        barcodes = body["sample_barcodes"]
+    elif 'project_id' in body:
+        project_id = body["project_id"]
+        barcodes = get_barcodes_for(project_id)
+
+    unprocessed_barcodes = None
+
     if len(barcodes) > 1000:
-        return jsonify({"message": "Too many barcodes requested"}), 400
-    summary = per_sample(None, barcodes, strip_sampleid)
-    return jsonify(summary), 200
+        unprocessed_barcodes = barcodes[1000:]
+        barcodes = barcodes[0:1000]
+
+    results = {'samples': per_sample(None, barcodes, strip_sampleid)}
+
+    if unprocessed_barcodes:
+        results['partial_result'] = True
+
+        # if returning a partial result, include the remainder of the barcodes
+        # so that they can be used in a subsequent query like a paging
+        # mechanism.
+        results['unprocessed_barcodes'] = unprocessed_barcodes
+    else:
+        results['partial_result'] = False
+
+    return jsonify(results), 200
 
 
 def create_daklapack_orders(body, token_info):
@@ -469,18 +556,6 @@ def _create_daklapack_order(order_dict):
                             post_response.status_code}
             return response_msg
 
-        # IFF submission is successful AND has fulfillment hold msg,
-        # email hold fulfillment info and the order id to Daklapack contact
-        email_success = None
-        if daklapack_order.fulfillment_hold_msg:
-            email_success = send_daklapack_hold_email(daklapack_order)
-            # if couldn't send the fulfillment hold message for any reason,
-            # still DO save order to db bc it WAS sent to Daklapack, but also
-            # record the email failure to the db and return info to caller
-            if not email_success:
-                daklapack_order.set_last_polling_info(
-                    "fulfillment hold message not sent")
-
         # write order to db
         admin_repo = AdminRepo(t)
         order_id = admin_repo.create_daklapack_order(daklapack_order)
@@ -489,8 +564,7 @@ def _create_daklapack_order(order_dict):
     status_msg = {"order_address":
                   daklapack_order.order_structure[ADDR_DICT_KEY],
                   "order_success": True,
-                  "order_id": order_id,
-                  "email_success": email_success}
+                  "order_id": order_id}
     return status_msg
 
 
@@ -508,10 +582,8 @@ def search_activation(token_info, email_query=None, code_query=None):
         return jsonify([i.to_api() for i in infos]), 200
 
 
-def address_verification(token_info, address_1, address_2=None, city=None,
-                         state=None, postal=None, country=None):
-    validate_admin_access(token_info)
-
+def address_verification(address_1=None, address_2=None,
+                         city=None, state=None, postal=None, country=None):
     if address_1 is None or len(address_1) < 1 or \
             postal is None or len(postal) < 1 or \
             country is None or len(country) < 1:
@@ -538,10 +610,25 @@ def post_campaign_information(body, token_info):
     with Transaction() as t:
         campaign_repo = CampaignRepo(t)
 
-        if 'campaign_id' in body:
-            res = campaign_repo.update_campaign(body)
-        else:
-            res = campaign_repo.create_campaign(body)
+        try:
+            res = campaign_repo.create_campaign(**body)
+        except ValueError as e:
+            raise RepoException(e)
+
+        t.commit()
+        return jsonify(res), 200
+
+
+def put_campaign_information(body, token_info):
+    validate_admin_access(token_info)
+
+    with Transaction() as t:
+        campaign_repo = CampaignRepo(t)
+
+        try:
+            res = campaign_repo.update_campaign(**body)
+        except ValueError as e:
+            raise RepoException(e)
 
         t.commit()
         return jsonify(res), 200
@@ -579,6 +666,7 @@ def list_barcode_query_fields(token_info):
         admin_repo = AdminRepo(t)
         projects_list = admin_repo.get_projects(False)
 
+    projects_list.sort(key=lambda x: x.project_name)
     filter_fields = []
     filter_fields.append(
         {
@@ -688,3 +776,59 @@ def qiita_barcode_query(body, token_info):
     )
 
     return jsonify(qiita_data), 200
+
+
+def delete_account(account_id, token_info):
+    validate_admin_access(token_info)
+
+    with Transaction() as t:
+        acct_repo = AccountRepo(t)
+        src_repo = SourceRepo(t)
+        samp_repo = SampleRepo(t)
+        sar_repo = SurveyAnswersRepo(t)
+
+        acct = acct_repo.get_account(account_id)
+        if acct is None:
+            return jsonify(message="Account not found", code=404), 404
+        else:
+            # the account is already scrubbed so let's stop early
+            if acct.account_type == 'deleted':
+                return None, 204
+
+        sample_count = 0
+        sources = src_repo.get_sources_in_account(account_id)
+
+        for source in sources:
+            samples = samp_repo.get_samples_by_source(account_id, source.id)
+
+            has_samples = len(samples) > 0
+            sample_count += len(samples)
+
+            for sample in samples:
+                # we scrub rather than disassociate in the event that the
+                # sample is in our freezers but not with an up-to-date scan
+                samp_repo.scrub(account_id, source.id, sample.id)
+
+            surveys = sar_repo.list_answered_surveys(account_id, source.id)
+            if has_samples:
+                # if we have samples, we need to scrub survey / source
+                # free text
+                for survey_id in surveys:
+                    sar_repo.scrub(account_id, source.id, survey_id)
+                src_repo.scrub(account_id, source.id)
+            else:
+                # if we do not have associated samples, then the source
+                # is safe to delete
+                for survey_id in surveys:
+                    sar_repo.delete_answered_survey(account_id, survey_id)
+                src_repo.delete_source(account_id, source.id)
+
+        # an account is safe to delete if there are no associated samples
+        if sample_count > 0:
+            acct_repo.scrub(account_id)
+        else:
+            acct_repo.delete_account(account_id)
+
+        t.commit()
+
+    return None, 204

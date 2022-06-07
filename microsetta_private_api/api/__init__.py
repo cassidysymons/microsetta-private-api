@@ -1,6 +1,7 @@
 from ._account import (
     find_accounts_for_login, register_account, claim_legacy_acct,
-    read_account, update_account, check_email_match, verify_jwt,
+    read_account, update_account, check_email_match, _verify_jwt,
+    _verify_jwt_mock
 )
 from ._consent import (
     render_consent_doc,
@@ -13,6 +14,7 @@ from ._survey import (
     read_survey_template, read_survey_templates, read_answered_survey,
     read_answered_surveys, submit_answered_survey,
     read_answered_survey_associations, top_food_report,
+    read_myfoodrepo_available_slots
 )
 from ._sample import (
     read_sample_association, associate_sample, read_sample_associations,
@@ -24,9 +26,37 @@ from ._activation import (
     check_activation
 )
 
+from ._vioscreen import (
+    read_sample_vioscreen_session, read_sample_vioscreen_percent_energy,
+    read_sample_vioscreen_dietary_score, read_sample_vioscreen_supplements,
+    read_sample_vioscreen_food_components,
+    read_sample_vioscreen_eating_patterns,
+    read_sample_vioscreen_mpeds, read_sample_vioscreen_food_consumption,
+    get_vioscreen_dietary_scores_by_component,
+    get_vioscreen_dietary_scores_descriptions,
+    get_vioscreen_food_components_by_code,
+    get_vioscreen_food_components_descriptions
+)
+
 from ._campaign import (
     get_campaign_information
 )
+
+from ._interested_user import (
+    create_interested_user, get_interested_user_address_update,
+    put_interested_user_address_update
+)
+
+from ..config_manager import SERVER_CONFIG
+
+
+verify_jwt = _verify_jwt
+if SERVER_CONFIG.get('disable_authentication', False):
+    import sys
+    print("WARNING: jwt authentication disabled",
+          file=sys.stderr, flush=True)
+    verify_jwt = _verify_jwt_mock
+
 
 __all__ = [
     'find_accounts_for_login',
@@ -48,6 +78,7 @@ __all__ = [
     'read_answered_surveys',
     'read_answered_survey_associations',
     'top_food_report',
+    'read_myfoodrepo_available_slots',
     'read_sample_association',
     'associate_sample',
     'read_sample_associations',
@@ -60,5 +91,20 @@ __all__ = [
     'verify_jwt',
     'get_preparations',
     'check_activation',
-    'get_campaign_information'
+    'read_sample_vioscreen_session',
+    'read_sample_vioscreen_percent_energy',
+    'read_sample_vioscreen_dietary_score',
+    'read_sample_vioscreen_supplements',
+    'read_sample_vioscreen_food_components',
+    'read_sample_vioscreen_eating_patterns',
+    'read_sample_vioscreen_mpeds',
+    'read_sample_vioscreen_food_consumption',
+    'get_vioscreen_dietary_scores_by_component',
+    'get_vioscreen_dietary_scores_descriptions',
+    'get_vioscreen_food_components_by_code',
+    'get_vioscreen_food_components_descriptions',
+    'get_campaign_information',
+    'create_interested_user',
+    'get_interested_user_address_update',
+    'put_interested_user_address_update'
 ]

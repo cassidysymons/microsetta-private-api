@@ -9,6 +9,7 @@ import datetime
 from dateutil.parser import isoparse
 from urllib.parse import urlencode
 from unittest import TestCase
+from math import isclose
 import microsetta_private_api.server
 from microsetta_private_api import localization
 from microsetta_private_api.model.preparation import Preparation
@@ -18,10 +19,26 @@ from microsetta_private_api.repo.account_repo import AccountRepo
 from microsetta_private_api.repo.source_repo import SourceRepo
 from microsetta_private_api.repo.survey_answers_repo import SurveyAnswersRepo
 from microsetta_private_api.repo.sample_repo import SampleRepo
+from microsetta_private_api.repo.vioscreen_repo import (
+    VioscreenSessionRepo, VioscreenPercentEnergyRepo,
+    VioscreenDietaryScoreRepo, VioscreenSupplementsRepo,
+    VioscreenFoodComponentsRepo, VioscreenEatingPatternsRepo,
+    VioscreenMPedsRepo, VioscreenFoodConsumptionRepo
+)
 from microsetta_private_api.model.account import Account
 from microsetta_private_api.model.source import Source, HumanInfo, NonHumanInfo
 from microsetta_private_api.model.sample import Sample, SampleInfo
 from microsetta_private_api.model.address import Address
+from microsetta_private_api.model.vioscreen import (
+    VioscreenSession,
+    VioscreenPercentEnergy, VioscreenPercentEnergyComponent,
+    VioscreenDietaryScore, VioscreenDietaryScoreComponent,
+    VioscreenSupplements, VioscreenSupplementsComponent,
+    VioscreenFoodComponents, VioscreenFoodComponentsComponent,
+    VioscreenEatingPatterns, VioscreenEatingPatternsComponent,
+    VioscreenMPeds, VioscreenMPedsComponent,
+    VioscreenFoodConsumption, VioscreenFoodConsumptionComponent
+)
 from microsetta_private_api.api.tests.test_integration import \
     _create_mock_kit, _remove_mock_kit, BARCODE, MOCK_SAMPLE_ID
 
@@ -117,6 +134,7 @@ DUMMY_SURVEY_ANSWERS_MODEL = {
     '115': 'K7G-2G8'}
 
 DUMMY_EMPTY_SAMPLE_INFO = {
+    'accession_urls': [],
     'sample_barcode': BARCODE,
     'sample_datetime': None,
     'sample_id': MOCK_SAMPLE_ID,
@@ -303,10 +321,11 @@ def delete_dummy_accts():
                          kit_id=FAKE_KIT)
 
         for curr_acct_id in acct_ids:
-            sources = source_repo.get_sources_in_account(curr_acct_id)
+            sources = source_repo.get_sources_in_account(curr_acct_id,
+                                                         allow_revoked=True)
             for curr_source in sources:
                 source_samples = sample_repo.get_samples_by_source(
-                    curr_acct_id, curr_source.id)
+                    curr_acct_id, curr_source.id, allow_revoked=True)
                 sample_ids = [x.id for x in source_samples]
                 all_sample_ids.extend(sample_ids)
 
@@ -531,7 +550,13 @@ def client(request):
         with patch("microsetta_private_api.api."
                    "verify_jwt") as mock_v:
             mock_v.side_effect = mock_verify
-            yield client
+            # This is a bit moronic, but since qiita won't be available
+            # from the test machine, every file that grabs a qclient
+            # needs to be patched to use a magic mock.
+            with patch("microsetta_private_api.api._sample.qclient"), \
+                    patch("microsetta_private_api.admin.admin_impl.qclient"), \
+                    patch("microsetta_private_api.repo.qiita_repo.qclient"):
+                yield client
 
 
 @pytest.mark.usefixtures("client")
@@ -838,6 +863,192 @@ class AccountsTests(ApiTests):
 
 @pytest.mark.usefixtures("client")
 class AccountTests(ApiTests):
+    def test_account_scrub_success(self):
+        # setup an account with a source and sample
+        dummy_acct_id, dummy_source_id = create_dummy_source(
+            "Bo", Source.SOURCE_TYPE_HUMAN, DUMMY_HUMAN_SOURCE,
+            create_dummy_1=True)
+
+        create_dummy_kit(dummy_acct_id, dummy_source_id)
+        _ = create_dummy_answered_survey(
+            dummy_acct_id, dummy_source_id, dummy_sample_id=MOCK_SAMPLE_ID)
+
+        base_url = '/api/accounts/{0}/sources/{1}/samples'.format(
+            dummy_acct_id, dummy_source_id)
+        sample_url = "{0}/{1}".format(base_url, MOCK_SAMPLE_ID)
+
+        sample_body = {'sample_site': 'Stool',
+                       "sample_notes": "foobar",
+                       'sample_datetime': "2017-07-21T17:32:28Z"}
+
+        put_resp = self.client.put(
+            '%s?%s' % (sample_url, self.default_lang_querystring),
+            json=sample_body,
+            headers=self.dummy_auth
+        )
+        self.assertEqual(200, put_resp.status_code)
+
+        _ = create_dummy_acct(create_dummy_1=False,
+                              iss=ACCT_MOCK_ISS_3,
+                              sub=ACCT_MOCK_SUB_3,
+                              dummy_is_admin=True)
+
+        # now let's scrub it
+        response = self.client.delete(
+            '/api/accounts/%s' %
+            (dummy_acct_id,),
+            headers=make_headers(FAKE_TOKEN_ADMIN))
+
+        # check response code
+        self.assertEqual(204, response.status_code)
+
+        # pull the account details
+        response = self.client.get(
+            '/api/accounts/%s?%s' %
+            (dummy_acct_id, self.default_lang_querystring),
+            headers=make_headers(FAKE_TOKEN_ADMIN))
+
+        self.assertEqual(200, response.status_code)
+        response_obj = json.loads(response.data)
+
+        for k in DUMMY_ACCT_INFO:
+            if k in (KIT_NAME_KEY, 'language'):
+                continue
+            self.assertNotEqual(DUMMY_ACCT_INFO[k],
+                                response_obj[k])
+
+        # verify deleting is idempotent
+        response = self.client.delete(
+            '/api/accounts/%s' %
+            (dummy_acct_id,),
+            headers=make_headers(FAKE_TOKEN_ADMIN))
+
+        # check response code
+        self.assertEqual(204, response.status_code)
+
+        # pull the account details again
+        response = self.client.get(
+            '/api/accounts/%s?%s' %
+            (dummy_acct_id, self.default_lang_querystring),
+            headers=make_headers(FAKE_TOKEN_ADMIN))
+
+        self.assertEqual(200, response.status_code)
+        response_obj2 = json.loads(response.data)
+
+        self.assertEqual(response_obj, response_obj2)
+
+        # make sure we cannot pull the details as it is now revoked
+        response = self.client.get(
+            '/api/accounts/%s/sources/%s?%s' %
+            (dummy_acct_id, dummy_source_id,
+             self.default_lang_querystring),
+            headers=make_headers(FAKE_TOKEN_ADMIN))
+
+        self.assertEqual(404, response.status_code)
+
+        # trick the database to "unrevoke" the sample to allow us to verify
+        # the details are scrubbed
+        with Transaction() as t:
+            cur = t.cursor()
+            cur.execute("""UPDATE ag.source
+                           SET date_revoked=NULL
+                           WHERE id=%s""",
+                        (dummy_source_id, ))
+            t.commit()
+
+        response = self.client.get(
+            '/api/accounts/%s/sources/%s?%s' %
+            (dummy_acct_id, dummy_source_id,
+             self.default_lang_querystring),
+            headers=make_headers(FAKE_TOKEN_ADMIN))
+
+        self.assertEqual(200, response.status_code)
+        response_obj = json.loads(response.data)
+
+        self.assertEqual(response_obj['source_name'],
+                         'scrubbed')
+        self.assertEqual(response_obj['consent']['participant_email'],
+                         'scrubbed@microsetta.ucsd.edu')
+
+        # pull the sample details
+        response = self.client.get(
+            '/api/accounts/%s/sources/%s/samples/%s?%s' %
+            (dummy_acct_id, dummy_source_id, MOCK_SAMPLE_ID,
+             self.default_lang_querystring),
+            headers=make_headers(FAKE_TOKEN_ADMIN))
+
+        self.assertEqual(200, response.status_code)
+        response_obj = json.loads(response.data)
+        self.assertEqual(response_obj['sample_notes'], 'scrubbed')
+        self.assertEqual(response_obj['sample_site'],
+                         sample_body['sample_site'])
+
+        # strip the trailing "Z" which comes from the database... easier
+        # than loading into datetime
+        self.assertEqual(response_obj['sample_datetime'],
+                         sample_body['sample_datetime'][:-1])
+
+    def test_account_delete_without_samples(self):
+        # setup an account with a source and sample
+        dummy_acct_id, dummy_source_id = create_dummy_source(
+            "Bo", Source.SOURCE_TYPE_HUMAN, DUMMY_HUMAN_SOURCE,
+            create_dummy_1=True)
+
+        _ = create_dummy_acct(create_dummy_1=False,
+                              iss=ACCT_MOCK_ISS_3,
+                              sub=ACCT_MOCK_SUB_3,
+                              dummy_is_admin=True)
+
+        # now let's scrub it
+        response = self.client.delete(
+            '/api/accounts/%s' %
+            (dummy_acct_id,),
+            headers=make_headers(FAKE_TOKEN_ADMIN))
+
+        # check response code
+        self.assertEqual(204, response.status_code)
+
+        # verify it is deleted
+        response = self.client.get(
+            '/api/accounts/%s?%s' %
+            (dummy_acct_id, self.default_lang_querystring),
+            headers=make_headers(FAKE_TOKEN_ADMIN))
+
+        # check response code
+        self.assertEqual(404, response.status_code)
+
+    def test_account_scrub_non_existant(self):
+        response = self.client.delete(
+            '/api/accounts/%s' %
+            (MISSING_ACCT_ID, ),
+            headers=self.dummy_auth)
+
+        # check response code
+        self.assertEqual(401, response.status_code)
+
+        _ = create_dummy_acct(create_dummy_1=False,
+                              iss=ACCT_MOCK_ISS_3,
+                              sub=ACCT_MOCK_SUB_3,
+                              dummy_is_admin=True)
+
+        response = self.client.delete(
+            '/api/accounts/%s' %
+            (MISSING_ACCT_ID, ),
+            headers=make_headers(FAKE_TOKEN_ADMIN))
+
+        # check response code
+        self.assertEqual(404, response.status_code)
+
+    def test_account_scrub_non_admin(self):
+        dummy_acct_id = create_dummy_acct(create_dummy_1=True)
+
+        response = self.client.delete(
+            '/api/accounts/%s' %
+            (dummy_acct_id, ),
+            headers=self.dummy_auth)
+
+        # check response code
+        self.assertEqual(401, response.status_code)
 
     # region account view/get tests
     def test_account_view_success(self):
@@ -1211,6 +1422,16 @@ class SourceTests(ApiTests):
 
 @pytest.mark.usefixtures("client")
 class SurveyTests(ApiTests):
+    def test_myfoodrepo_slots(self):
+        get_resp = self.client.get('/api/slots/myfoodrepo/?language_tag=en_US',
+                                   headers=self.dummy_auth)
+        self.assertEqual(get_resp.status_code, 200)
+        data = json.loads(get_resp.data)
+        self.assertTrue(data['number_of_available_slots'] > 0)
+
+        # no slots should be used
+        self.assertEqual(data['number_of_available_slots'],
+                         data['total_number_of_slots'])
 
     def _validate_survey_info(self, response, expected_output, expected_model):
         # load the response body
@@ -1761,3 +1982,910 @@ class SampleTests(ApiTests):
         self.assertEqual(len(response_obj), 1)
 
         self.assertEqual(response_obj[0]["num_sequences"], 18302)
+
+
+@pytest.mark.usefixtures("client")
+class VioscreenTests(ApiTests):
+    def setUp(self):
+        super().setUp()
+
+        with Transaction() as t:
+            cur = t.cursor()
+            cur.execute("""SELECT DISTINCT ag_login_id as account_id,
+                                           source_id,
+                                           ag_kit_barcode_id as sample_id
+                           FROM ag.ag_kit_barcodes
+                           JOIN ag.ag_login_surveys using (source_id)
+                           WHERE barcode='000004216'""")
+            acct_id, src_id, samp_id = cur.fetchone()
+            self.acct_id = acct_id
+            self.src_id = src_id
+            self.samp_id = samp_id
+            self.vio_id = '674533d367f222d2'
+
+            cur.execute("""INSERT INTO ag.vioscreen_registry
+                           (account_id, source_id, sample_id, vio_id)
+                           VALUES (%s, %s, %s, %s)""",
+                        (self.acct_id, self.src_id, self.samp_id, self.vio_id))
+            t.commit()
+
+    def tearDown(self):
+        with Transaction() as t:
+            cur = t.cursor()
+            cur.execute("""DELETE FROM ag.vioscreen_registry
+                           WHERE account_id=%s
+                               AND source_id=%s
+                               AND sample_id=%s
+                               AND vio_id=%s""",
+                        (self.acct_id, self.src_id, self.samp_id, self.vio_id))
+
+            sessionId = "000ada854d4f45f5abda90ccade7f0a8"
+            cur.execute("""DELETE FROM ag.vioscreen_foodconsumptioncomponents
+                           WHERE sessionId = %s""",
+                        (sessionId,))
+            cur.execute("""DELETE FROM ag.vioscreen_foodconsumption
+                           WHERE sessionId = %s""",
+                        (sessionId,))
+            cur.execute("""DELETE FROM ag.vioscreen_mpeds
+                           WHERE sessionId = %s""",
+                        (sessionId,))
+            cur.execute("""DELETE FROM ag.vioscreen_eatingpatterns
+                           WHERE sessionId = %s""",
+                        (sessionId,))
+            cur.execute("""DELETE FROM ag.vioscreen_foodcomponents
+                           WHERE sessionId = %s""",
+                        (sessionId,))
+            cur.execute("""DELETE FROM ag.vioscreen_supplements
+                           WHERE sessionId = %s""",
+                        (sessionId,))
+            cur.execute("""DELETE FROM ag.vioscreen_dietaryscore
+                           WHERE sessionId = %s""",
+                        (sessionId,))
+            cur.execute("""DELETE FROM ag.vioscreen_percentenergy
+                           WHERE sessionId = %s""",
+                        (sessionId,))
+            cur.execute("""DELETE FROM ag.vioscreen_sessions
+                           WHERE sessionId = %s""",
+                        (sessionId,))
+
+            sessionId2 = "000ada854d4f45f5abda90ccade7f0a9"
+            cur.execute("""DELETE FROM ag.vioscreen_foodcomponents
+                           WHERE sessionId = %s""",
+                        (sessionId2,))
+            cur.execute("""DELETE FROM ag.vioscreen_dietaryscore
+                           WHERE sessionId = %s""",
+                        (sessionId2,))
+            cur.execute("""DELETE FROM ag.vioscreen_sessions
+                           WHERE sessionId = %s""",
+                        (sessionId2,))
+            t.commit()
+
+        super().tearDown()
+
+    def _url_constructor(self):
+        return (f'/api/accounts/{self.acct_id}'
+                f'/sources/{self.src_id}'
+                f'/samples/{self.samp_id}')
+
+    def test_get_sample_vioscreen_session_200(self):
+        vioscreen_session = VioscreenSession(
+            sessionId="000ada854d4f45f5abda90ccade7f0a8",
+            username="674533d367f222d2",
+            protocolId=344,
+            status="Finished",
+            startDate="2014-10-08T18:55:12.747",
+            endDate="2014-10-08T18:57:07.503",
+            cultureCode="en-US",
+            created="2014-10-08T18:55:07.96",
+            modified="2017-07-29T03:56:04.22"
+        )
+
+        with Transaction() as t:
+            vio_sess = VioscreenSessionRepo(t)
+            vio_sess.upsert_session(vioscreen_session)
+
+            t.commit()
+
+        url = self._url_constructor() + '/vioscreen/session'
+        _ = create_dummy_acct(create_dummy_1=True,
+                              iss=ACCT_MOCK_ISS_3,
+                              sub=ACCT_MOCK_SUB_3,
+                              dummy_is_admin=True)
+        get_response = self.client.get(url,
+                                       headers=make_headers(FAKE_TOKEN_ADMIN))
+
+        self.assertEqual(get_response.status_code, 200)
+
+        response_obj = json.loads(get_response.data)
+        self.assertEqual(response_obj['username'], vioscreen_session.username)
+        self.assertEqual(response_obj['sessionId'],
+                         vioscreen_session.sessionId)
+        self.assertEqual(response_obj['status'], vioscreen_session.status)
+
+    def test_get_sample_vioscreen_session_404(self):
+        url = self._url_constructor() + '/vioscreen/session'
+        _ = create_dummy_acct(create_dummy_1=True,
+                              iss=ACCT_MOCK_ISS_3,
+                              sub=ACCT_MOCK_SUB_3,
+                              dummy_is_admin=True)
+        get_response = self.client.get(url,
+                                       headers=make_headers(FAKE_TOKEN_ADMIN))
+
+        self.assertEqual(get_response.status_code, 404)
+
+        response_obj = json.loads(get_response.data)
+        self.assertEqual(response_obj['message'], "Session not found")
+
+    def test_get_sample_vioscreen_percent_energy_200(self):
+        vioscreen_session = VioscreenSession(
+            sessionId="000ada854d4f45f5abda90ccade7f0a8",
+            username="674533d367f222d2",
+            protocolId=344,
+            status="Finished",
+            startDate="2014-10-08T18:55:12.747",
+            endDate="2014-10-08T18:57:07.503",
+            cultureCode="en-US",
+            created="2014-10-08T18:55:07.96",
+            modified="2017-07-29T03:56:04.22"
+        )
+
+        vioscreen_percent_e = VioscreenPercentEnergy(
+            sessionId="000ada854d4f45f5abda90ccade7f0a8",
+            energy_components=[
+                VioscreenPercentEnergyComponent(
+                    code="%protein",
+                    description="Percent of calories from Protein",
+                    short_description="Protein",
+                    units="%",
+                    amount=14.101114742737353
+                )
+            ]
+        )
+
+        with Transaction() as t:
+            vio_sess = VioscreenSessionRepo(t)
+            vio_sess.upsert_session(vioscreen_session)
+            vio_perc = VioscreenPercentEnergyRepo(t)
+            vio_perc.insert_percent_energy(vioscreen_percent_e)
+            t.commit()
+
+        url = self._url_constructor() + '/vioscreen/percentenergy'
+        _ = create_dummy_acct(create_dummy_1=True,
+                              iss=ACCT_MOCK_ISS_3,
+                              sub=ACCT_MOCK_SUB_3,
+                              dummy_is_admin=True)
+        get_response = self.client.get(url,
+                                       headers=make_headers(FAKE_TOKEN_ADMIN))
+
+        self.assertEqual(get_response.status_code, 200)
+
+        response_obj = json.loads(get_response.data)
+        self.assertEqual(response_obj['sessionId'],
+                         vioscreen_percent_e.sessionId)
+        self.assertEqual(response_obj['calculations'][0]['code'],
+                         vioscreen_percent_e.energy_components[0].code)
+        self.assertTrue(isclose(response_obj['calculations'][0]['amount'],
+                        vioscreen_percent_e.energy_components[0].amount,
+                        rel_tol=0.00000000000001))
+
+    def test_get_sample_vioscreen_percent_energy_404(self):
+        vioscreen_session = VioscreenSession(
+            sessionId="000ada854d4f45f5abda90ccade7f0a8",
+            username="674533d367f222d2",
+            protocolId=344,
+            status="Finished",
+            startDate="2014-10-08T18:55:12.747",
+            endDate="2014-10-08T18:57:07.503",
+            cultureCode="en-US",
+            created="2014-10-08T18:55:07.96",
+            modified="2017-07-29T03:56:04.22"
+        )
+
+        with Transaction() as t:
+            vio_sess = VioscreenSessionRepo(t)
+            vio_sess.upsert_session(vioscreen_session)
+            t.commit()
+
+        url = self._url_constructor() + '/vioscreen/percentenergy'
+        _ = create_dummy_acct(create_dummy_1=True,
+                              iss=ACCT_MOCK_ISS_3,
+                              sub=ACCT_MOCK_SUB_3,
+                              dummy_is_admin=True)
+        get_response = self.client.get(url,
+                                       headers=make_headers(FAKE_TOKEN_ADMIN))
+
+        self.assertEqual(get_response.status_code, 404)
+
+        response_obj = json.loads(get_response.data)
+        self.assertEqual(response_obj['message'], "Percent Energy not found")
+
+    def test_get_sample_vioscreen_dietary_score_200(self):
+        vioscreen_session = VioscreenSession(
+            sessionId="000ada854d4f45f5abda90ccade7f0a8",
+            username="674533d367f222d2",
+            protocolId=344,
+            status="Finished",
+            startDate="2014-10-08T18:55:12.747",
+            endDate="2014-10-08T18:57:07.503",
+            cultureCode="en-US",
+            created="2014-10-08T18:55:07.96",
+            modified="2017-07-29T03:56:04.22"
+        )
+
+        vioscreen_dietary_score = VioscreenDietaryScore(
+            sessionId="000ada854d4f45f5abda90ccade7f0a8",
+            scoresType="Hei2010",
+            scores=[
+                VioscreenDietaryScoreComponent(code="TotalVegetables",
+                                               name="",
+                                               score=5.5,
+                                               lowerLimit=0.0,
+                                               upperLimit=10.0)
+            ]
+        )
+
+        with Transaction() as t:
+            vio_sess = VioscreenSessionRepo(t)
+            vio_sess.upsert_session(vioscreen_session)
+            vio_diet = VioscreenDietaryScoreRepo(t)
+            vio_diet.insert_dietary_scores([vioscreen_dietary_score, ])
+            t.commit()
+
+        url = self._url_constructor() + '/vioscreen/dietaryscore'
+        _ = create_dummy_acct(create_dummy_1=True,
+                              iss=ACCT_MOCK_ISS_3,
+                              sub=ACCT_MOCK_SUB_3,
+                              dummy_is_admin=True)
+        get_response = self.client.get(url,
+                                       headers=make_headers(FAKE_TOKEN_ADMIN))
+
+        self.assertEqual(get_response.status_code, 200)
+
+        response_obj = json.loads(get_response.data)[0]
+        self.assertEqual(response_obj['sessionId'],
+                         vioscreen_dietary_score.sessionId)
+        self.assertEqual(response_obj['type'],
+                         vioscreen_dietary_score.scoresType)
+        self.assertEqual(response_obj['scores'][0]['type'],
+                         vioscreen_dietary_score.scores[0].code)
+        self.assertEqual(response_obj['scores'][0]['score'],
+                         vioscreen_dietary_score.scores[0].score)
+
+    def test_get_sample_vioscreen_dietary_score_404(self):
+        vioscreen_session = VioscreenSession(
+            sessionId="000ada854d4f45f5abda90ccade7f0a8",
+            username="674533d367f222d2",
+            protocolId=344,
+            status="Finished",
+            startDate="2014-10-08T18:55:12.747",
+            endDate="2014-10-08T18:57:07.503",
+            cultureCode="en-US",
+            created="2014-10-08T18:55:07.96",
+            modified="2017-07-29T03:56:04.22"
+        )
+
+        with Transaction() as t:
+            vio_sess = VioscreenSessionRepo(t)
+            vio_sess.upsert_session(vioscreen_session)
+            t.commit()
+
+        url = self._url_constructor() + '/vioscreen/dietaryscore'
+        _ = create_dummy_acct(create_dummy_1=True,
+                              iss=ACCT_MOCK_ISS_3,
+                              sub=ACCT_MOCK_SUB_3,
+                              dummy_is_admin=True)
+        get_response = self.client.get(url,
+                                       headers=make_headers(FAKE_TOKEN_ADMIN))
+
+        self.assertEqual(get_response.status_code, 404)
+
+        response_obj = json.loads(get_response.data)
+        self.assertEqual(response_obj['message'], "Dietary Score not found")
+
+    def test_get_sample_vioscreen_supplements_200(self):
+        vioscreen_session = VioscreenSession(
+            sessionId="000ada854d4f45f5abda90ccade7f0a8",
+            username="674533d367f222d2",
+            protocolId=344,
+            status="Finished",
+            startDate="2014-10-08T18:55:12.747",
+            endDate="2014-10-08T18:57:07.503",
+            cultureCode="en-US",
+            created="2014-10-08T18:55:07.96",
+            modified="2017-07-29T03:56:04.22"
+        )
+
+        vioscreen_supplements = VioscreenSupplements(
+            sessionId="000ada854d4f45f5abda90ccade7f0a8",
+            supplements_components=[
+                VioscreenSupplementsComponent(
+                    supplement="MultiVitamin",
+                    frequency="7",
+                    amount="200",
+                    average="200"),
+                VioscreenSupplementsComponent(
+                    supplement="Calcium",
+                    frequency="",
+                    amount="",
+                    average="")])
+
+        with Transaction() as t:
+            vio_sess = VioscreenSessionRepo(t)
+            vio_sess.upsert_session(vioscreen_session)
+            vio_supp = VioscreenSupplementsRepo(t)
+            vio_supp.insert_supplements(vioscreen_supplements)
+            t.commit()
+
+        url = self._url_constructor() + '/vioscreen/supplements'
+        _ = create_dummy_acct(create_dummy_1=True,
+                              iss=ACCT_MOCK_ISS_3,
+                              sub=ACCT_MOCK_SUB_3,
+                              dummy_is_admin=True)
+        get_response = self.client.get(url,
+                                       headers=make_headers(FAKE_TOKEN_ADMIN))
+
+        self.assertEqual(get_response.status_code, 200)
+
+        response_obj = json.loads(get_response.data)
+        self.assertEqual(response_obj['sessionId'],
+                         vioscreen_supplements.sessionId)
+
+    def test_get_sample_vioscreen_supplements_404(self):
+        vioscreen_session = VioscreenSession(
+            sessionId="000ada854d4f45f5abda90ccade7f0a8",
+            username="674533d367f222d2",
+            protocolId=344,
+            status="Finished",
+            startDate="2014-10-08T18:55:12.747",
+            endDate="2014-10-08T18:57:07.503",
+            cultureCode="en-US",
+            created="2014-10-08T18:55:07.96",
+            modified="2017-07-29T03:56:04.22"
+        )
+
+        with Transaction() as t:
+            vio_sess = VioscreenSessionRepo(t)
+            vio_sess.upsert_session(vioscreen_session)
+            t.commit()
+
+        url = self._url_constructor() + '/vioscreen/supplements'
+        _ = create_dummy_acct(create_dummy_1=True,
+                              iss=ACCT_MOCK_ISS_3,
+                              sub=ACCT_MOCK_SUB_3,
+                              dummy_is_admin=True)
+        get_response = self.client.get(url,
+                                       headers=make_headers(FAKE_TOKEN_ADMIN))
+
+        self.assertEqual(get_response.status_code, 404)
+
+        response_obj = json.loads(get_response.data)
+        self.assertEqual(response_obj['message'], "Supplements not found")
+
+    def test_get_sample_vioscreen_food_components_200(self):
+        vioscreen_session = VioscreenSession(
+            sessionId="000ada854d4f45f5abda90ccade7f0a8",
+            username="674533d367f222d2",
+            protocolId=344,
+            status="Finished",
+            startDate="2014-10-08T18:55:12.747",
+            endDate="2014-10-08T18:57:07.503",
+            cultureCode="en-US",
+            created="2014-10-08T18:55:07.96",
+            modified="2017-07-29T03:56:04.22"
+        )
+
+        vioscreen_food_components = VioscreenFoodComponents(
+            sessionId="000ada854d4f45f5abda90ccade7f0a8",
+            components=[
+                VioscreenFoodComponentsComponent(
+                    code="acesupot",
+                    description="Acesulfame Potassium",
+                    units="mg",
+                    amount=0.0,
+                    valueType="Amount"
+                )
+            ]
+        )
+
+        with Transaction() as t:
+            vio_sess = VioscreenSessionRepo(t)
+            vio_sess.upsert_session(vioscreen_session)
+            vio_food = VioscreenFoodComponentsRepo(t)
+            vio_food.insert_food_components(vioscreen_food_components)
+            t.commit()
+
+        url = self._url_constructor() + '/vioscreen/foodcomponents'
+        _ = create_dummy_acct(create_dummy_1=True,
+                              iss=ACCT_MOCK_ISS_3,
+                              sub=ACCT_MOCK_SUB_3,
+                              dummy_is_admin=True)
+        get_response = self.client.get(url,
+                                       headers=make_headers(FAKE_TOKEN_ADMIN))
+
+        self.assertEqual(get_response.status_code, 200)
+
+        response_obj = json.loads(get_response.data)
+        self.assertEqual(response_obj['sessionId'],
+                         vioscreen_food_components.sessionId)
+
+    def test_get_sample_vioscreen_food_components_404(self):
+        vioscreen_session = VioscreenSession(
+            sessionId="000ada854d4f45f5abda90ccade7f0a8",
+            username="674533d367f222d2",
+            protocolId=344,
+            status="Finished",
+            startDate="2014-10-08T18:55:12.747",
+            endDate="2014-10-08T18:57:07.503",
+            cultureCode="en-US",
+            created="2014-10-08T18:55:07.96",
+            modified="2017-07-29T03:56:04.22"
+        )
+
+        with Transaction() as t:
+            vio_sess = VioscreenSessionRepo(t)
+            vio_sess.upsert_session(vioscreen_session)
+            t.commit()
+
+        url = self._url_constructor() + '/vioscreen/foodcomponents'
+        _ = create_dummy_acct(create_dummy_1=True,
+                              iss=ACCT_MOCK_ISS_3,
+                              sub=ACCT_MOCK_SUB_3,
+                              dummy_is_admin=True)
+        get_response = self.client.get(url,
+                                       headers=make_headers(FAKE_TOKEN_ADMIN))
+
+        self.assertEqual(get_response.status_code, 404)
+
+        response_obj = json.loads(get_response.data)
+        self.assertEqual(response_obj['message'], "Food Components not found")
+
+    def test_get_sample_vioscreen_eating_patterns_200(self):
+        vioscreen_session = VioscreenSession(
+            sessionId="000ada854d4f45f5abda90ccade7f0a8",
+            username="674533d367f222d2",
+            protocolId=344,
+            status="Finished",
+            startDate="2014-10-08T18:55:12.747",
+            endDate="2014-10-08T18:57:07.503",
+            cultureCode="en-US",
+            created="2014-10-08T18:55:07.96",
+            modified="2017-07-29T03:56:04.22"
+        )
+
+        vioscreen_eating_patterns = VioscreenEatingPatterns(
+            sessionId="000ada854d4f45f5abda90ccade7f0a8",
+            components=[
+                VioscreenEatingPatternsComponent(code="ADDEDFATS",
+                                                 description="Eating Pattern",
+                                                 units="PerDay",
+                                                 amount=8.07030444201639,
+                                                 valueType="Amount")
+            ]
+        )
+
+        with Transaction() as t:
+            vio_sess = VioscreenSessionRepo(t)
+            vio_sess.upsert_session(vioscreen_session)
+            vio_eat = VioscreenEatingPatternsRepo(t)
+            vio_eat.insert_eating_patterns(vioscreen_eating_patterns)
+            t.commit()
+
+        url = self._url_constructor() + '/vioscreen/eatingpatterns'
+        _ = create_dummy_acct(create_dummy_1=True,
+                              iss=ACCT_MOCK_ISS_3,
+                              sub=ACCT_MOCK_SUB_3,
+                              dummy_is_admin=True)
+        get_response = self.client.get(url,
+                                       headers=make_headers(FAKE_TOKEN_ADMIN))
+
+        self.assertEqual(get_response.status_code, 200)
+
+        response_obj = json.loads(get_response.data)
+        self.assertEqual(response_obj['sessionId'],
+                         vioscreen_eating_patterns.sessionId)
+
+    def test_get_sample_vioscreen_eating_patterns_404(self):
+        vioscreen_session = VioscreenSession(
+            sessionId="000ada854d4f45f5abda90ccade7f0a8",
+            username="674533d367f222d2",
+            protocolId=344,
+            status="Finished",
+            startDate="2014-10-08T18:55:12.747",
+            endDate="2014-10-08T18:57:07.503",
+            cultureCode="en-US",
+            created="2014-10-08T18:55:07.96",
+            modified="2017-07-29T03:56:04.22"
+        )
+
+        with Transaction() as t:
+            vio_sess = VioscreenSessionRepo(t)
+            vio_sess.upsert_session(vioscreen_session)
+            t.commit()
+
+        url = self._url_constructor() + '/vioscreen/eatingpatterns'
+        _ = create_dummy_acct(create_dummy_1=True,
+                              iss=ACCT_MOCK_ISS_3,
+                              sub=ACCT_MOCK_SUB_3,
+                              dummy_is_admin=True)
+        get_response = self.client.get(url,
+                                       headers=make_headers(FAKE_TOKEN_ADMIN))
+
+        self.assertEqual(get_response.status_code, 404)
+
+        response_obj = json.loads(get_response.data)
+        self.assertEqual(response_obj['message'], "Eating Patterns not found")
+
+    def test_get_sample_vioscreen_mpeds_200(self):
+        vioscreen_session = VioscreenSession(
+            sessionId="000ada854d4f45f5abda90ccade7f0a8",
+            username="674533d367f222d2",
+            protocolId=344,
+            status="Finished",
+            startDate="2014-10-08T18:55:12.747",
+            endDate="2014-10-08T18:57:07.503",
+            cultureCode="en-US",
+            created="2014-10-08T18:55:07.96",
+            modified="2017-07-29T03:56:04.22"
+        )
+
+        vioscreen_mpeds = VioscreenMPeds(
+            sessionId="000ada854d4f45f5abda90ccade7f0a8",
+            components=[
+                VioscreenMPedsComponent(
+                    code="A_BEV",
+                    description="MPED: Total drinks of alcohol",
+                    units="alc_drinks",
+                    amount=1.30647563412786,
+                    valueType="Amount"
+                )
+            ]
+        )
+
+        with Transaction() as t:
+            vio_sess = VioscreenSessionRepo(t)
+            vio_sess.upsert_session(vioscreen_session)
+            vio_mped = VioscreenMPedsRepo(t)
+            vio_mped.insert_mpeds(vioscreen_mpeds)
+            t.commit()
+
+        url = self._url_constructor() + '/vioscreen/mpeds'
+        _ = create_dummy_acct(create_dummy_1=True,
+                              iss=ACCT_MOCK_ISS_3,
+                              sub=ACCT_MOCK_SUB_3,
+                              dummy_is_admin=True)
+        get_response = self.client.get(url,
+                                       headers=make_headers(FAKE_TOKEN_ADMIN))
+
+        self.assertEqual(get_response.status_code, 200)
+
+        response_obj = json.loads(get_response.data)
+        self.assertEqual(response_obj['sessionId'], vioscreen_mpeds.sessionId)
+
+    def test_get_sample_vioscreen_mpeds_404(self):
+        vioscreen_session = VioscreenSession(
+            sessionId="000ada854d4f45f5abda90ccade7f0a8",
+            username="674533d367f222d2",
+            protocolId=344,
+            status="Finished",
+            startDate="2014-10-08T18:55:12.747",
+            endDate="2014-10-08T18:57:07.503",
+            cultureCode="en-US",
+            created="2014-10-08T18:55:07.96",
+            modified="2017-07-29T03:56:04.22"
+        )
+
+        with Transaction() as t:
+            vio_sess = VioscreenSessionRepo(t)
+            vio_sess.upsert_session(vioscreen_session)
+            t.commit()
+
+        url = self._url_constructor() + '/vioscreen/mpeds'
+        _ = create_dummy_acct(create_dummy_1=True,
+                              iss=ACCT_MOCK_ISS_3,
+                              sub=ACCT_MOCK_SUB_3,
+                              dummy_is_admin=True)
+        get_response = self.client.get(url,
+                                       headers=make_headers(FAKE_TOKEN_ADMIN))
+
+        self.assertEqual(get_response.status_code, 404)
+
+        response_obj = json.loads(get_response.data)
+        self.assertEqual(response_obj['message'], "MPeds not found")
+
+    def test_get_sample_vioscreen_food_consumption_200(self):
+        vioscreen_session = VioscreenSession(
+            sessionId="000ada854d4f45f5abda90ccade7f0a8",
+            username="674533d367f222d2",
+            protocolId=344,
+            status="Finished",
+            startDate="2014-10-08T18:55:12.747",
+            endDate="2014-10-08T18:57:07.503",
+            cultureCode="en-US",
+            created="2014-10-08T18:55:07.96",
+            modified="2017-07-29T03:56:04.22"
+        )
+
+        vioscreen_food_consumption = VioscreenFoodConsumption(
+            sessionId="000ada854d4f45f5abda90ccade7f0a8",
+            components=[
+                VioscreenFoodConsumptionComponent(
+                    foodCode="20001",
+                    description="Apples, applesauce and pears",
+                    foodGroup="Fruits",
+                    amount=1.0,
+                    frequency=28,
+                    consumptionAdjustment=1.58695652173913,
+                    servingSizeText="1 apple or pear, 1/2 cup",
+                    servingFrequencyText="2-3 per month",
+                    created="2017-07-29T02:02:54.72",
+                    data=[
+                        VioscreenFoodComponentsComponent(
+                            code="acesupot",
+                            description="Acesulfame Potassium",
+                            units="mg",
+                            amount=0.0,
+                            valueType="Amount"
+                        )
+                    ]
+                )
+            ]
+        )
+
+        with Transaction() as t:
+            vio_sess = VioscreenSessionRepo(t)
+            vio_sess.upsert_session(vioscreen_session)
+            vio_cons = VioscreenFoodConsumptionRepo(t)
+            vio_cons.insert_food_consumption(vioscreen_food_consumption)
+            t.commit()
+
+        url = self._url_constructor() + '/vioscreen/foodconsumption'
+        _ = create_dummy_acct(create_dummy_1=True,
+                              iss=ACCT_MOCK_ISS_3,
+                              sub=ACCT_MOCK_SUB_3,
+                              dummy_is_admin=True)
+        get_response = self.client.get(url,
+                                       headers=make_headers(FAKE_TOKEN_ADMIN))
+
+        self.assertEqual(get_response.status_code, 200)
+
+        response_obj = json.loads(get_response.data)
+        self.assertEqual(response_obj['sessionId'],
+                         vioscreen_food_consumption.sessionId)
+
+    def test_get_sample_vioscreen_food_consumption_404(self):
+        vioscreen_session = VioscreenSession(
+            sessionId="000ada854d4f45f5abda90ccade7f0a8",
+            username="674533d367f222d2",
+            protocolId=344,
+            status="Finished",
+            startDate="2014-10-08T18:55:12.747",
+            endDate="2014-10-08T18:57:07.503",
+            cultureCode="en-US",
+            created="2014-10-08T18:55:07.96",
+            modified="2017-07-29T03:56:04.22"
+        )
+
+        with Transaction() as t:
+            vio_sess = VioscreenSessionRepo(t)
+            vio_sess.upsert_session(vioscreen_session)
+            t.commit()
+
+        url = self._url_constructor() + '/vioscreen/foodconsumption'
+        _ = create_dummy_acct(create_dummy_1=True,
+                              iss=ACCT_MOCK_ISS_3,
+                              sub=ACCT_MOCK_SUB_3,
+                              dummy_is_admin=True)
+        get_response = self.client.get(url,
+                                       headers=make_headers(FAKE_TOKEN_ADMIN))
+
+        self.assertEqual(get_response.status_code, 404)
+
+        response_obj = json.loads(get_response.data)
+        self.assertEqual(response_obj['message'], "Food Consumption not found")
+
+    def test_get_vioscreen_dietary_scores_by_component_200(self):
+        vioscreen_session = VioscreenSession(
+            sessionId="000ada854d4f45f5abda90ccade7f0a8",
+            username="674533d367f222d2",
+            protocolId=344,
+            status="Finished",
+            startDate="2014-10-08T18:55:12.747",
+            endDate="2014-10-08T18:57:07.503",
+            cultureCode="en-US",
+            created="2014-10-08T18:55:07.96",
+            modified="2017-07-29T03:56:04.22"
+        )
+
+        vioscreen_session2 = VioscreenSession(
+            sessionId="000ada854d4f45f5abda90ccade7f0a9",
+            username="674533d367f222d2",
+            protocolId=344,
+            status="Finished",
+            startDate="2014-10-08T18:55:12.747",
+            endDate="2014-10-08T18:57:07.503",
+            cultureCode="en-US",
+            created="2014-10-08T18:55:07.96",
+            modified="2017-07-29T03:56:04.22"
+        )
+
+        vioscreen_dietary_score = VioscreenDietaryScore(
+            sessionId="000ada854d4f45f5abda90ccade7f0a8",
+            scoresType="Hei2010",
+            scores=[
+                VioscreenDietaryScoreComponent(code="TotalVegetables",
+                                               name="",
+                                               score=5.5,
+                                               lowerLimit=0.0,
+                                               upperLimit=10.0),
+                VioscreenDietaryScoreComponent(code="TotalFruit",
+                                               name="",
+                                               score=1.0,
+                                               lowerLimit=0.0,
+                                               upperLimit=10.0)
+            ]
+        )
+
+        vioscreen_dietary_score2 = VioscreenDietaryScore(
+            sessionId="000ada854d4f45f5abda90ccade7f0a9",
+            scoresType="Hei2010",
+            scores=[
+                VioscreenDietaryScoreComponent(code="TotalVegetables",
+                                               name="",
+                                               score=7.3,
+                                               lowerLimit=0.0,
+                                               upperLimit=10.0)
+            ]
+        )
+
+        with Transaction() as t:
+            vio_sess = VioscreenSessionRepo(t)
+            vio_sess.upsert_session(vioscreen_session)
+            vio_sess.upsert_session(vioscreen_session2)
+            vio_diet = VioscreenDietaryScoreRepo(t)
+            vio_diet.insert_dietary_scores([vioscreen_dietary_score, ])
+            vio_diet.insert_dietary_scores([vioscreen_dietary_score2, ])
+            t.commit()
+
+        url = ('/api/vioscreen/dietaryscore/type/Hei2010/code/TotalVegetables')
+        _ = create_dummy_acct(create_dummy_1=True,
+                              iss=ACCT_MOCK_ISS_3,
+                              sub=ACCT_MOCK_SUB_3,
+                              dummy_is_admin=True)
+        get_response = self.client.get(url,
+                                       headers=make_headers(FAKE_TOKEN_ADMIN))
+
+        self.assertEqual(get_response.status_code, 200)
+
+        response_obj = json.loads(get_response.data)
+        self.assertEqual(response_obj['scores'], [5.5, 7.3])
+
+    def test_get_vioscreen_dietary_scores_by_component_404(self):
+        url = ('/api/vioscreen/dietaryscore/type/Hei2010/code/TotalVegetables')
+        _ = create_dummy_acct(create_dummy_1=True,
+                              iss=ACCT_MOCK_ISS_3,
+                              sub=ACCT_MOCK_SUB_3,
+                              dummy_is_admin=True)
+        get_response = self.client.get(url,
+                                       headers=make_headers(FAKE_TOKEN_ADMIN))
+
+        self.assertEqual(get_response.status_code, 404)
+
+        response_obj = json.loads(get_response.data)
+        self.assertEqual(response_obj['message'], "Dietary Scores not found")
+
+    def test_get_vioscreen_dietary_scores_descriptions_200(self):
+        url = ('/api/vioscreen/dietaryscore/')
+        _ = create_dummy_acct(create_dummy_1=True,
+                              iss=ACCT_MOCK_ISS_3,
+                              sub=ACCT_MOCK_SUB_3,
+                              dummy_is_admin=True)
+        get_response = self.client.get(url,
+                                       headers=make_headers(FAKE_TOKEN_ADMIN))
+
+        self.assertEqual(get_response.status_code, 200)
+
+        response_obj = json.loads(get_response.data)
+        self.assertEqual(response_obj['Hei2010']['TotalVegetables'],
+                         ['Total Vegetables', 0.0, 5.0])
+
+    def test_get_vioscreen_food_components_by_code_200(self):
+        vioscreen_session = VioscreenSession(
+            sessionId="000ada854d4f45f5abda90ccade7f0a8",
+            username="674533d367f222d2",
+            protocolId=344,
+            status="Finished",
+            startDate="2014-10-08T18:55:12.747",
+            endDate="2014-10-08T18:57:07.503",
+            cultureCode="en-US",
+            created="2014-10-08T18:55:07.96",
+            modified="2017-07-29T03:56:04.22"
+        )
+
+        vioscreen_session2 = VioscreenSession(
+            sessionId="000ada854d4f45f5abda90ccade7f0a9",
+            username="674533d367f222d2",
+            protocolId=344,
+            status="Finished",
+            startDate="2014-10-08T18:55:12.747",
+            endDate="2014-10-08T18:57:07.503",
+            cultureCode="en-US",
+            created="2014-10-08T18:55:07.96",
+            modified="2017-07-29T03:56:04.22"
+        )
+
+        vioscreen_food_components = VioscreenFoodComponents(
+            sessionId="000ada854d4f45f5abda90ccade7f0a8",
+            components=[
+                VioscreenFoodComponentsComponent(
+                    code="acesupot",
+                    description="Acesulfame Potassium",
+                    units="mg",
+                    amount=3.0,
+                    valueType="Amount"
+                )
+            ]
+        )
+
+        vioscreen_food_components2 = VioscreenFoodComponents(
+            sessionId="000ada854d4f45f5abda90ccade7f0a9",
+            components=[
+                VioscreenFoodComponentsComponent(
+                    code="acesupot",
+                    description="Acesulfame Potassium",
+                    units="mg",
+                    amount=4.5,
+                    valueType="Amount"
+                )
+            ]
+        )
+
+        with Transaction() as t:
+            vio_sess = VioscreenSessionRepo(t)
+            vio_sess.upsert_session(vioscreen_session)
+            vio_sess.upsert_session(vioscreen_session2)
+            vio_food = VioscreenFoodComponentsRepo(t)
+            vio_food.insert_food_components(vioscreen_food_components)
+            vio_food.insert_food_components(vioscreen_food_components2)
+            t.commit()
+
+        url = ('/api/vioscreen/foodcomponents/code/acesupot')
+        _ = create_dummy_acct(create_dummy_1=True,
+                              iss=ACCT_MOCK_ISS_3,
+                              sub=ACCT_MOCK_SUB_3,
+                              dummy_is_admin=True)
+        get_response = self.client.get(url,
+                                       headers=make_headers(FAKE_TOKEN_ADMIN))
+
+        self.assertEqual(get_response.status_code, 200)
+
+        response_obj = json.loads(get_response.data)
+        self.assertEqual(response_obj['amounts'], [3.0, 4.5])
+
+    def test_get_vioscreen_food_components_by_code_404(self):
+        url = ('/api/vioscreen/foodcomponents/code/acesupot')
+        _ = create_dummy_acct(create_dummy_1=True,
+                              iss=ACCT_MOCK_ISS_3,
+                              sub=ACCT_MOCK_SUB_3,
+                              dummy_is_admin=True)
+        get_response = self.client.get(url,
+                                       headers=make_headers(FAKE_TOKEN_ADMIN))
+
+        self.assertEqual(get_response.status_code, 404)
+
+        response_obj = json.loads(get_response.data)
+        self.assertEqual(response_obj['message'], 'Food Components not found')
+
+    def test_get_vioscreen_food_components_descriptions_200(self):
+        url = ('/api/vioscreen/foodcomponents')
+        _ = create_dummy_acct(create_dummy_1=True,
+                              iss=ACCT_MOCK_ISS_3,
+                              sub=ACCT_MOCK_SUB_3,
+                              dummy_is_admin=True)
+        get_response = self.client.get(url,
+                                       headers=make_headers(FAKE_TOKEN_ADMIN))
+
+        self.assertEqual(get_response.status_code, 200)
+
+        response_obj = json.loads(get_response.data)
+        self.assertEqual(response_obj['acesupot'],
+                         ['Acesulfame Potassium', 'mg', 'Amount'])
